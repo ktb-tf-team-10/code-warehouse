@@ -60,10 +60,10 @@ class GenerateRequest(BaseModel):
 
 
 # --- 유틸리티: Spring 상태 업데이트 ---
-def notify_spring(task_id: str, step: int, step_name: str, progress: int, model_url: str = None, error: str = None):
+def notify_spring(job_id: str, step: int, step_name: str, progress: int, model_url: str = None, error: str = None):
     """Spring에 현재 상태 업데이트"""
     payload = {
-        "task_id": task_id,
+        "jobId": job_id,
         "step": step,
         "step_name": step_name,
         "progress": progress,
@@ -74,7 +74,7 @@ def notify_spring(task_id: str, step: int, step_name: str, progress: int, model_
         payload["error"] = error
 
     try:
-        requests.post(f"{SPRING_CALLBACK_URL}/api/tasks/{task_id}/status", json=payload, timeout=10)
+        requests.post(f"{SPRING_CALLBACK_URL}/api/internal/invitations/progress", json=payload, timeout=10)
     except Exception as e:
         print(f"Failed to notify Spring: {e}")
 
