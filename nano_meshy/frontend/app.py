@@ -2,6 +2,8 @@ import streamlit as st
 import requests
 import time
 import os
+import base64
+import streamlit.components.v1 as components
 from PIL import Image
 
 # Configuration
@@ -38,6 +40,8 @@ if "meshy_task_id" not in st.session_state:
     st.session_state.meshy_task_id = None
 if "generation_status" not in st.session_state:
     st.session_state.generation_status = None # None, "generating", "completed", "failed"
+if "logs" not in st.session_state:
+    st.session_state.logs = []
 
 # --- Step 2: Generate Nano Banana Image ---
 st.header("2. Nano Banana 이미지 생성")
@@ -56,6 +60,8 @@ if st.button("이미지 생성하기", type="primary", disabled=(not img1 or not
             if response.status_code == 200:
                 result = response.json()
                 st.session_state.generated_image_path = result["image_path"]
+                if "logs" in result:
+                    st.session_state.logs.append({"source": "Nano Banana", "data": result["logs"], "time": time.strftime("%H:%M:%S")})
                 st.success("이미지 생성 완료!")
                 # Reset 3D state if new image generated
                 st.session_state.meshy_task_id = None
@@ -80,7 +86,11 @@ if st.session_state.generated_image_path:
                 payload = {"image_path": st.session_state.generated_image_path}
                 response = requests.post(f"{API_URL}/generate-3d", json=payload)
                 if response.status_code == 200:
-                    task_id = response.json()["task_id"]
+                    resp_json = response.json()
+                    task_id = resp_json["task_id"]
+                    if "logs" in resp_json:
+                         st.session_state.logs.append({"source": "Meshy Request", "data": resp_json["logs"], "time": time.strftime("%H:%M:%S")})
+
                     st.session_state.meshy_task_id = task_id
                     st.session_state.generation_status = "generating"
                     st.session_state.start_time = time.time()
@@ -126,11 +136,47 @@ if st.session_state.generated_image_path:
                 if status == "SUCCEEDED":
                     st.session_state.generation_status = "completed"
                     st.success(f"3D 모델 생성 완료! (총 소요시간: {elapsed:.1f}초)")
-                    # Show download link
+                    
                     glb_url = data.get("model_urls", {}).get("glb")
                     if glb_url:
-                        st.markdown(f"[GLB 모델 다운로드]({glb_url})")
-                        st.balloons()
+                        # 1. Download Model
+                        st.info("모델 다운로드 중...")
+                        model_resp = requests.get(glb_url)
+                        if model_resp.status_code == 200:
+                            # Save locally
+                            model_filename = f"model_{task_id}.glb"
+                            save_path = os.path.join(NANO_BANANA_DIR, model_filename)
+                            with open(save_path, "wb") as f:
+                                f.write(model_resp.content)
+                            st.success(f"모델 저장 완료: {save_path}")
+
+                            # 2. Display Model (Model Viewer)
+                            st.info("모델 렌더링 중...")
+                            b64 = base64.b64encode(model_resp.content).decode("utf-8")
+                            
+                            html_code = f"""
+                            <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"></script>
+                            <model-viewer
+                                src="data:model/gltf-binary;base64,{b64}"
+                                alt="Nano Banana 3D Model"
+                                auto-rotate
+                                camera-controls
+                                style="width: 100%; height: 500px; background-color: #f0f0f0; border-radius: 10px;"
+                            >
+                            </model-viewer>
+                            """
+                            components.html(html_code, height=520)
+                            
+                            # Download Button
+                            st.download_button(
+                                label="GLB 파일 다운로드",
+                                data=model_resp.content,
+                                file_name=model_filename,
+                                mime="model/gltf-binary"
+                            )
+                        else:
+                            st.error("모델 파일 다운로드 실패")
+
                     st.session_state.start_time = None # Reset timer
                     break
                 
@@ -154,3 +200,13 @@ if st.session_state.generated_image_path:
 
 else:
     st.info("먼저 이미지를 생성해주세요.")
+
+# --- Developer Logs ---
+with st.expander("🛠️ Developer Logs (Request/Response)"):
+    if st.session_state.logs:
+        for log in reversed(st.session_state.logs):
+            st.markdown(f"**[{log['time']}] {log['source']}**")
+            st.json(log['data'])
+            st.divider()
+    else:
+        st.caption("아직 기록된 로그가 없습니다.")
