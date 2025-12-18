@@ -1,0 +1,66 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1 # ECR Public은 us-east-1 필수
+  ECR_REGISTRY: public.ecr.aws
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }} # alias/repo 형태 (예: a1b2c3d4/nano-meshy)
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR Public
+        run: |
+          aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+
+      - name: Build, tag, and push image to Amazon ECR Public
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd nano_meshy
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 기존 컨테이너 중지 및 삭제
+            docker stop nano-meshy || true
+            docker rm nano-meshy || true
+
+            # 새 이미지 pull (퍼블릭은 로그인 불필요)
+            docker pull public.ecr.aws/${{ secrets.ECR_REPOSITORY }}:latest
+
+            # 컨테이너 실행
+            docker run -d \
+              --name nano-meshy \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              --env-file /home/ubuntu/.env \
+              public.ecr.aws/${{ secrets.ECR_REPOSITORY }}:latest
+
+            # 오래된 이미지 정리
+            docker image prune -af
