@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "properties": {
+    "greetings": {
+      "type": "array",
+      "description": "청첩장 인사말 3가지 버전",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "description": "2-4문장으로 구성된 인사말"
+      }
+    },
+    "invitations": {
+      "type": "array",
+      "description": "초대 문구 3가지 버전",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "description": "1-2문장으로 구성된 초대 문구"
+      }
+    },
+    "location": {
+      "type": "string",
+      "description": "예식장 위치 안내 문구 (1가지)"
+    },
+    "closing": {
+      "type": "array",
+      "description": "맺음말 3가지 버전",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "description": "1-2문장으로 구성된 맺음말"
+      }
+    }
+  },
+  "required": ["greetings", "invitations", "location", "closing"],
+  "additionalProperties": false
+}
