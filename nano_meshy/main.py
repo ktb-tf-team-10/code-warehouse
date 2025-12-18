@@ -3,10 +3,9 @@ import io
 import time
 import base64
 import requests
-import mimetypes
 import boto3
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from google import genai
@@ -19,7 +18,8 @@ from dotenv import load_dotenv
 # env variables 
 load_dotenv()
 
-NANO_BANANA_DIR = "nano_banana_3d"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+NANO_BANANA_DIR = os.path.join(BASE_DIR, "nano_banana_3d")
 os.makedirs(NANO_BANANA_DIR, exist_ok=True)
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
@@ -34,6 +34,9 @@ if not S3_BUCKET:
 S3_REGION = os.environ.get("S3_REGION", "ap-northeast-2")
 if not S3_REGION:
     raise RuntimeError("S3_REGION not found in environment variables.")
+SPRING_CALLBACK_URL = os.environ.get("SPRING_CALLBACK_URL")
+if not SPRING_CALLBACK_URL:
+    raise RuntimeError("SPRING_CALLBACK_URL not found in environment variables.")
 
 MESHY_BASE = "https://api.meshy.ai/v1"
 CLOUD_FRONT_DOMAIN = "https://dns7warjxrmv9.cloudfront.net"
@@ -49,87 +52,175 @@ s3_client = boto3.client("s3", region_name=S3_REGION)
 app = FastAPI()
 
 # dto
-class NanoRequest(BaseModel):
+class GenerateRequest(BaseModel):
+    task_id: str  # Spring에서 생성해서 전달
     image_url1: str
     image_url2: Optional[str] = None
     image_url3: Optional[str] = None
-    # task_id: str
 
-@app.post("/api/generate-nano")
-async def generate_nano(request: NanoRequest):
+
+# --- 유틸리티: Spring 상태 업데이트 ---
+def notify_spring(task_id: str, step: int, step_name: str, progress: int, model_url: str = None, error: str = None):
+    """Spring에 현재 상태 업데이트"""
+    payload = {
+        "task_id": task_id,
+        "step": step,
+        "step_name": step_name,
+        "progress": progress,
+    }
+    if model_url:
+        payload["model_url"] = model_url
+    if error:
+        payload["error"] = error
+
     try:
-        # Gemini 클라이언트 초기화
-        client = genai.Client(api_key=GOOGLE_API_KEY)
+        requests.post(f"{SPRING_CALLBACK_URL}/api/tasks/{task_id}/status", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Failed to notify Spring: {e}")
 
-        # URL에서 이미지 다운로드 후 Gemini에 전달
+
+# --- 유틸리티: bytes -> data URI 변환 ---
+def bytes_to_data_uri(image_bytes: bytes, mime_type: str) -> str:
+    """이미지 bytes를 Meshy가 요구하는 data URI로 변환"""
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{b64}"
+
+# --- 통합 API: 이미지 생성 + 3D 모델 생성 ---
+@app.post("/api/generate")
+async def generate(request: GenerateRequest, background_tasks: BackgroundTasks):
+    """
+    이미지 생성 + 3D 모델 생성을 하나의 API로 처리합니다.
+    즉시 응답하고 백그라운드에서 작업을 진행합니다.
+    """
+    background_tasks.add_task(
+        process_pipeline,
+        request.task_id,
+        request.image_url1,
+        request.image_url2,
+        request.image_url3
+    )
+    return JSONResponse({"status": "processing", "task_id": request.task_id})
+
+
+def process_pipeline(task_id: str, image_url1: str, image_url2: str = None, image_url3: str = None):
+    """백그라운드에서 전체 파이프라인 실행"""
+    try:
+        # === 1단계: 이미지 생성 (0~30%) ===
+        print(f"[{task_id}] 1단계: 이미지 생성 시작 (15%)")
+        notify_spring(task_id, step=1, step_name="GENERATING_IMAGE", progress=15)
+
+        client = genai.Client(api_key=GOOGLE_API_KEY)
         contents = [PROMPT_TEXT]
         contents.append("\n\n[Image 1]:")
-        contents.append(download_image_as_part(request.image_url1))
+        contents.append(download_image_as_part(image_url1))
 
-        if request.image_url2:
+        if image_url2:
             contents.append("\n\n[Image 2]:")
-            contents.append(download_image_as_part(request.image_url2))
+            contents.append(download_image_as_part(image_url2))
 
-        if request.image_url3:
+        if image_url3:
             contents.append("\n\n[Image 3]:")
-            contents.append(download_image_as_part(request.image_url3))
-        
-        # 4) Gemini 모델 호출하여 이미지 생성
-        # gemini-3-pro-image-preview 모델을 사용하며, 1:1 비율 / 2K 해상도를 요청합니다.
+            contents.append(download_image_as_part(image_url3))
+
         response = client.models.generate_content(
             model="gemini-3-pro-image-preview",
             contents=contents,
             config=types.GenerateContentConfig(
-                response_modalities=['TEXT', 'IMAGE'], # 텍스트와 이미지를 모두 반환받을 수 있도록 설정
+                response_modalities=['TEXT', 'IMAGE'],
                 image_config=types.ImageConfig(
                     aspect_ratio="1:1",
                     image_size="2K"
                 ),
             )
         )
-        
-        # 5) 생성된 이미지 추출
+
         generated_image = None
         for part in response.parts:
             if part.as_image():
                 generated_image = part.as_image()
                 break
-        
+
         if not generated_image:
-            if response.text:
-                raise HTTPException(status_code=500, detail=f"Gemini returned text instead of image: {response.text}")
-            raise HTTPException(status_code=500, detail="No image generated by Gemini.")
+            raise Exception("No image generated by Gemini")
 
-        # 이미지 확인 (개발용 - 배포 시 제거)
-        generated_image.show()
+        print(f"[{task_id}] 1단계: 이미지 생성 완료")
 
-        # 6) S3에 업로드
-        timestamp = int(time.time())
+        # === 2단계: 3D 모델 생성 (30~100%) ===
+        print(f"[{task_id}] 2단계: 3D 모델 생성 시작 (30%)")
+        notify_spring(task_id, step=2, step_name="GENERATING_3D", progress=30)
+
+        # 이미지를 data URI로 변환
         mime_type = generated_image.mime_type or "image/png"
-        ext = "jpg" if "jpeg" in mime_type else "png"
-        filename = f"nano_banana/{timestamp}.{ext}"
+        data_uri = bytes_to_data_uri(generated_image.image_bytes, mime_type)
 
-        # Gemini 이미지에서 bytes 직접 추출
-        buffer = io.BytesIO(generated_image.image_bytes)
+        # Meshy API 호출
+        session = get_meshy_session()
+        headers = {"Authorization": f"Bearer {MESHY_API_KEY}"}
+        payload = {
+            "image_url": data_uri,
+            "ai_model": "latest",
+            "should_texture": True,
+            "enable_pbr": False,
+            "should_remesh": True,
+            "topology": "triangle",
+            "target_polycount": 100000,
+            "symmetry_mode": "auto",
+        }
 
+        meshy_response = session.post(f"{MESHY_BASE}/image-to-3d", headers=headers, json=payload, timeout=60)
+        meshy_response.raise_for_status()
+        meshy_task_id = meshy_response.json().get("result")
+
+        # Meshy 폴링
+        while True:
+            status_response = session.get(f"{MESHY_BASE}/image-to-3d/{meshy_task_id}", headers=headers, timeout=30)
+            status_response.raise_for_status()
+            status_data = status_response.json()
+
+            meshy_status = status_data.get("status")
+            meshy_progress = status_data.get("progress", 0)
+
+            # 전체 진행률 계산 (30 + meshy_progress * 0.7)
+            total_progress = 30 + int(meshy_progress * 0.7)
+            print(f"[{task_id}] 2단계: 3D 모델 생성 중... ({total_progress}%)")
+            notify_spring(task_id, step=2, step_name="GENERATING_3D", progress=total_progress)
+
+            if meshy_status == "SUCCEEDED":
+                break
+            elif meshy_status == "FAILED":
+                raise Exception("Meshy 3D generation failed")
+
+            time.sleep(5)
+
+        # 3D 모델 URL 가져오기
+        model_url = status_data.get("model_urls", {}).get("glb")
+        if not model_url:
+            raise Exception("No GLB model URL returned from Meshy")
+
+        # === 3단계: S3에 3D 모델 저장 ===
+        model_response = requests.get(model_url, timeout=60)
+        model_response.raise_for_status()
+
+        timestamp = int(time.time())
+        filename = f"3d_models/{task_id}_{timestamp}.glb"
+
+        buffer = io.BytesIO(model_response.content)
         s3_client.upload_fileobj(
             buffer,
             S3_BUCKET,
             filename,
-            ExtraArgs={"ContentType": mime_type}
+            ExtraArgs={"ContentType": "model/gltf-binary"}
         )
 
-        response_url = f"{CLOUD_FRONT_DOMAIN}/{filename}"
+        s3_model_url = f"{CLOUD_FRONT_DOMAIN}/{filename}"
 
-        # 7) 성공 응답 반환
-        return JSONResponse({
-            "status": "success",
-            "image_url": response_url
-        })
+        # 완료 알림
+        print(f"[{task_id}] 완료! (100%) - {s3_model_url}")
+        notify_spring(task_id, step=2, step_name="COMPLETE", progress=100, model_url=s3_model_url)
 
     except Exception as e:
-        print(f"Error in generate_nano: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[{task_id}] 실패: {e}")
+        notify_spring(task_id, step=0, step_name="FAILED", progress=0, error=str(e))
 
 # --- 3. 유틸리티: Meshy API 통신 세션 (SSL 에러 방지용) ---
 def get_meshy_session():
@@ -152,31 +243,7 @@ def get_meshy_session():
     session.mount("http://", adapter)
     return session
 
-# --- 4. 유틸리티: 이미지 -> Data URI 변환 ---
-def file_to_data_uri(image_path: str) -> str:
-    """
-    로컬 이미지 파일을 읽어 Meshy API가 요구하는 Base64 encoded Data URI 형식으로 변환합니다.
-    예: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...
-    """
-    # 파일 확장자를 기반으로 MIME 타입 추측 (예: image/jpeg, image/png)
-    mime_type, _ = mimetypes.guess_type(image_path)
-    
-    # MIME 타입이 정확히 감지되지 않을 경우 확장자로 수동 할당
-    if mime_type not in ("image/jpeg", "image/png"):
-        if image_path.lower().endswith(".jpg") or image_path.lower().endswith(".jpeg"):
-            mime_type = "image/jpeg"
-        elif image_path.lower().endswith(".png"):
-            mime_type = "image/png"
-        else:
-            raise ValueError(f"Unsupported image type: {mime_type}")
-
-    # 파일을 바이너리 읽기 모드로 열어서 Base64 문자열로 인코딩
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    return f"data:{mime_type};base64,{b64}"
-
-# --- 5. 유틸리티: URL에서 이미지 다운로드 후 base64 인코딩 ---
+# --- 유틸리티: URL에서 이미지 다운로드 후 Gemini Part로 변환 ---
 def download_image_as_part(url: str) -> types.Part:
     """URL에서 이미지 다운로드 후 Gemini Part로 반환"""
     response = requests.get(url, timeout=30)
@@ -188,85 +255,6 @@ def download_image_as_part(url: str) -> types.Part:
 
     return types.Part.from_bytes(data=response.content, mime_type=content_type)
 
-# --- 6. API 엔드포인트 ---
-
-# 6.1. Nano Banana 이미지 생성 API (Google Gemini 사용)
-
-class MeshRequest(BaseModel):
-    image_path: str
-
-# 5.2. 3D 모델 생성 요청 API (Meshy AI 사용)
-@app.post("/api/generate-3d")
-async def generate_3d(request: MeshRequest):
-    """
-    생성된 이미지를 받아 Meshy AI에 3D 모델 생성을 요청합니다.
-    이 작업은 비동기로 진행되며 Task ID를 반환합니다.
-    """
-    image_path = request.image_path
-    if not os.path.exists(image_path):
-        raise HTTPException(status_code=404, detail="Image file not found")
-
-    try:
-        # 1) 이미지를 Data URI로 변환
-        data_uri = file_to_data_uri(image_path)
-        
-        # 2) Meshy 세션 및 헤더 준비
-        session = get_meshy_session()
-        headers = {"Authorization": f"Bearer {MESHY_API_KEY}"}
-        
-        # 3) 요청 페이로드 구성
-        # should_remesh=True, topology='triangle' 등은 웹/게임 엔진용 최적화를 위한 설정입니다.
-        payload = {
-            "image_url": data_uri,
-            "ai_model": "latest",
-            "should_texture": True,
-            "enable_pbr": False,
-            "should_remesh": True,      # 토폴로지 리메싱 활성화
-            "topology": "triangle",     # 삼각형 토폴로지 사용
-            "target_polycount": 100000,  # 목표 폴리곤 수 (사용자 설정값: 100,000)
-            "symmetry_mode": "auto",    # 대칭 자동 감지
-        }
-        
-        # 4) Meshy API 호출 (작업 등록)
-        response = session.post(f"{MESHY_BASE}/image-to-3d", headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        
-        # 5) 개발자용 로그 생성 (데이터 URI는 너무 길어서 제외)
-        log_info = {
-            "request_payload": {k: v for k, v in payload.items() if k != "image_url"}, 
-            "response": response.json()
-        }
-        
-        # 6) Task ID 반환
-        task_id = response.json().get("result")
-        return {"task_id": task_id, "logs": log_info}
-
-    except Exception as e:
-        print(f"Error in generate_3d: {e}")
-        detail = str(e)
-        if isinstance(e, requests.exceptions.SSLError):
-            detail = f"SSL Error: {e}"
-        raise HTTPException(status_code=500, detail=detail)
-
-# 5.3. 작업 상태 확인 API
-@app.get("/api/status/{task_id}")
-async def get_status(task_id: str):
-    """
-    특정 Task ID에 대한 현재 진행 상태(Status)와 진행률(Progress)을 조회합니다.
-    프론트엔드에서 주기적으로(Polling) 호출합니다.
-    """
-    try:
-        session = get_meshy_session()
-        headers = {"Authorization": f"Bearer {MESHY_API_KEY}"}
-        
-        # Meshy API에 상태 조회 요청
-        response = session.get(f"{MESHY_BASE}/image-to-3d/{task_id}", headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        # 응답 JSON 자체를 반환 (프론트엔드 로그 출력용으로도 사용됨)
-        return response.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
