@@ -5,7 +5,7 @@ import os
 from PIL import Image
 
 # Configuration
-API_URL = "http://localhost:8000/api"
+API_URL = "http://127.0.0.1:8000/api"
 NANO_BANANA_DIR = "nano_banana_3d"
 
 st.set_page_config(page_title="Nano Banana 3D Generator", layout="wide")
@@ -83,6 +83,7 @@ if st.session_state.generated_image_path:
                     task_id = response.json()["task_id"]
                     st.session_state.meshy_task_id = task_id
                     st.session_state.generation_status = "generating"
+                    st.session_state.start_time = time.time()
                     st.rerun()
                 else:
                     st.error(f"3D 생성 요청 실패: {response.text}")
@@ -93,11 +94,23 @@ if st.session_state.generated_image_path:
     if st.session_state.meshy_task_id and st.session_state.generation_status == "generating":
         task_id = st.session_state.meshy_task_id
         
+        # Display Task ID
+        st.info(f"Task ID: {task_id}")
+        
+        # Initialize timer if starting fresh
+        if "start_time" not in st.session_state or st.session_state.start_time is None:
+             st.session_state.start_time = time.time()
+
         progress_bar = st.progress(0)
         status_text = st.empty()
+        timer_text = st.empty()
         
         while True:
             try:
+                # Update Timer
+                elapsed = time.time() - st.session_state.start_time
+                timer_text.caption(f"경과 시간: {elapsed:.1f}초")
+
                 status_resp = requests.get(f"{API_URL}/status/{task_id}")
                 if status_resp.status_code != 200:
                     status_text.error("상태 확인 실패")
@@ -112,20 +125,22 @@ if st.session_state.generated_image_path:
                 
                 if status == "SUCCEEDED":
                     st.session_state.generation_status = "completed"
-                    st.success("3D 모델 생성 완료!")
+                    st.success(f"3D 모델 생성 완료! (총 소요시간: {elapsed:.1f}초)")
                     # Show download link
                     glb_url = data.get("model_urls", {}).get("glb")
                     if glb_url:
                         st.markdown(f"[GLB 모델 다운로드]({glb_url})")
                         st.balloons()
+                    st.session_state.start_time = None # Reset timer
                     break
                 
                 elif status in ["FAILED", "CANCELED"]:
                     st.session_state.generation_status = "failed"
                     st.error(f"생성 실패: {data.get('task_error', {}).get('message', '알 수 없는 오류')}")
+                    st.session_state.start_time = None # Reset timer
                     break
                 
-                time.sleep(2)
+                time.sleep(1) # Faster update for smooth timer
             except Exception as e:
                 st.error(f"폴링 중 오류 발생: {e}")
                 break
