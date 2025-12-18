@@ -60,6 +60,7 @@ jobs:
               --restart unless-stopped \
               -p 8000:8000 \
               --env-file /home/ubuntu/.env \
+              -e PYTHONUNBUFFERED=1 \
               public.ecr.aws/${{ secrets.ECR_REPOSITORY }}:latest
 
             # 오래된 이미지 정리
